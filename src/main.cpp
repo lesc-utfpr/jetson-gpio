@@ -1,60 +1,67 @@
 #include <ros/ros.h>
 #include <std_msgs/Bool.h>
-#include <jetsonGPIO.h>
+#include <gpiod.h>
 
-class GpioControlNode {
+#define GPIO_CHIP "/dev/gpiochip0" // GPIO chip device
+
+class GPIOController {
 public:
-    GpioControlNode() {
-        // Get the GPIO pin from the parameter server (default is pin 18)
-        ros::param::param<int>("~gpio_pin", gpio_pin_, 18);
-        
-        // Set up GPIO
-        if (jetsonGPIOInit() != 0) {
-            ROS_ERROR("Failed to initialize Jetson GPIO!");
+    GPIOController(ros::NodeHandle& nh, int gpio_pin) : gpio_pin_(gpio_pin) {
+        // Initialize GPIO
+        chip = gpiod_chip_open(GPIO_CHIP);
+        if (!chip) {
+            ROS_ERROR("Failed to open GPIO chip.");
             ros::shutdown();
-            return;
         }
 
-        // Set the specified GPIO pin as an output
-        if (GPIOpinMode(gpio_pin_, outputPin) != 0) {
-            ROS_ERROR("Failed to set GPIO pin mode!");
+        line = gpiod_chip_get_line(chip, gpio_pin_);
+        if (!line) {
+            ROS_ERROR("Failed to get GPIO line %d.", gpio_pin_);
+            gpiod_chip_close(chip);
             ros::shutdown();
-            return;
         }
 
-        // Subscribe to the /gpio_control topic to receive Boolean messages
-        subscriber_ = nh_.subscribe("/gpio_control", 10, &GpioControlNode::gpioCallback, this);
-        
-        ROS_INFO("Using GPIO pin %d", gpio_pin_);
+        if (gpiod_line_request_output(line, "gpio_control", 0) < 0) {
+            ROS_ERROR("Failed to request GPIO line %d as output.", gpio_pin_);
+            gpiod_chip_close(chip);
+            ros::shutdown();
+        }
+
+        // Subscribe to a topic that controls the GPIO state
+        gpio_sub = nh.subscribe("/gpio_control", 10, &GPIOController::gpioCallback, this);
+        ROS_INFO("GPIO Controller Node Started. Controlling GPIO %d. Listening on /gpio_control", gpio_pin_);
     }
 
-    ~GpioControlNode() {
-        // Clean up GPIO settings when node is shut down
-        GPIOpinMode(gpio_pin_, inputPin);
-        jetsonGPIOExit();
-    }
-
-    void gpioCallback(const std_msgs::Bool::ConstPtr& msg) {
-        if (msg->data) {
-            GPIOpinWrite(gpio_pin_, high);  // Set GPIO pin HIGH
-            ROS_INFO("GPIO Pin %d set HIGH", gpio_pin_);
-        } else {
-            GPIOpinWrite(gpio_pin_, low);   // Set GPIO pin LOW
-            ROS_INFO("GPIO Pin %d set LOW", gpio_pin_);
-        }
+    ~GPIOController() {
+        gpiod_line_set_value(line, 0);  // Turn off before exiting
+        gpiod_line_release(line);
+        gpiod_chip_close(chip);
     }
 
 private:
-    ros::NodeHandle nh_;
-    ros::Subscriber subscriber_;
+    gpiod_chip* chip;
+    gpiod_line* line;
     int gpio_pin_;
+    ros::Subscriber gpio_sub;
+
+    void gpioCallback(const std_msgs::Bool::ConstPtr& msg) {
+        int value = msg->data ? 1 : 0;
+        gpiod_line_set_value(line, value);
+        ROS_INFO("GPIO %d set to %d", gpio_pin_, value);
+    }
 };
 
 int main(int argc, char** argv) {
     ros::init(argc, argv, "gpio_control_node");
+    ros::NodeHandle nh("~"); // Use private namespace for parameters
 
-    GpioControlNode gpio_control_node;
-    
+    int gpio_pin;
+    if (!nh.getParam("gpio_pin", gpio_pin)) {
+        ROS_ERROR("No GPIO pin provided! Use _gpio_pin:=XX when running.");
+        return 1;
+    }
+
+    GPIOController gpioController(nh, gpio_pin);
     ros::spin();
 
     return 0;
